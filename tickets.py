@@ -5,7 +5,6 @@ import re
 from bs4 import BeautifulSoup
 import pandas as pd
 
-#url = "http://olympus.realpython.org/profiles/aphrodite"
 url = "http://www.comedymothership.com/shows"
 
 page = urlopen(url)
