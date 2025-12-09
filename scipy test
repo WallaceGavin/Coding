@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+
+# Assuming fab_vpd_npw_eqp is your input DataFrame
+df = fab_vpd_npw_eqp.copy()
+
+# 1. Grouping Key
+group_key = ['prc_eqp_id', 'item_id']
+
+# 2. Basic Outlier Filtering (e.g., filter runs outside of 3-sigma range)
+def robust_zscore_filter(group):
+    median = group['value'].median()
+    mad = stats.median_abs_deviation(group['value'])
+    # Using 3-sigma equivalent for MAD
+    threshold = median + (3 * 1.4826 * mad)
+    return group[(group['value'] <= threshold) & (group['value'] >= (median - 3 * 1.4826 * mad))]
+
+df_filtered = (
+    df.groupby(group_key)
+    .apply(robust_zscore_filter)
+    .reset_index(drop=True)
+)
+
+def calculate_ewma_and_check_trend(group_df, lambda_val=0.2, L_val=3.0):
+    # Sort by time
+    group_df = group_df.sort_values('prc_tkin_time').reset_index(drop=True)
+
+    # 1. Baseline Calculations (mu_0 and sigma_0)
+    mu_0 = group_df['value'].mean()
+    sigma_0 = group_df['value'].std()
+
+    if sigma_0 == 0:
+        # Cannot calculate limits if no variation
+        return group_df
+
+    # 2. EWMA Calculation
+    n = len(group_df)
+    ewma = np.zeros(n)
+    ewma[0] = mu_0 # Start at the historical mean
+
+    for i in range(1, n):
+        # Zi = lambda*Xi + (1-lambda)*Z(i-1)
+        ewma[i] = lambda_val * group_df['value'].iloc[i] + (1 - lambda_val) * ewma[i-1]
+
+    # 3. Control Limit Calculation
+    ucl = np.zeros(n)
+    lcl = np.zeros(n)
+    ewma_std_factor = np.sqrt(lambda_val / (2 - lambda_val))
+
+    for i in range(n):
+        i_plus_1 = i + 1 # Index for (1-lambda)^2i
+        # Standard Error of EWMA
+        se_ewma = sigma_0 * ewma_std_factor * np.sqrt(1 - (1 - lambda_val)**(2 * i_plus_1))
+        ucl[i] = mu_0 + L_val * se_ewma
+        lcl[i] = mu_0 - L_val * se_ewma
+
+    # 4. Trend Detection (Check for last 5 data points exceeding UCL)
+    group_df['EWMA'] = ewma
+    group_df['UCL'] = ucl
+    group_df['LCL'] = lcl
+
+    # Flag an 'Out-of-Control' event if EWMA exceeds the UCL/LCL
+    group_df['OOC_High'] = group_df['EWMA'] > group_df['UCL']
+    group_df['OOC_Low'] = group_df['EWMA'] < group_df['LCL']
+
+    # For reporting, check if the *most recent* data point is OOC (Out-of-Control)
+    group_df['Recent_OOC'] = (group_df['OOC_High'] | group_df['OOC_Low']).iloc[-1]
+
+    return group_df
+
+# Apply the function to all groups
+df_results = (
+    df_filtered.groupby(group_key)
+    .apply(calculate_ewma_and_check_trend)
+    .reset_index(drop=True)
+)
+
+# Filter to see which equipment/item_id combinations are currently trending up
+trending_up_groups = (
+    df_results[df_results['OOC_High'] == True]
+    .drop_duplicates(subset=group_key, keep='last')
+)
+
+# You are interested in the *most recent* runs that are OOC
+recent_ooc_groups = df_results[df_results['Recent_OOC'] == True]
+
+# Filter specifically for the upward trend
+final_report = recent_ooc_groups[recent_ooc_groups['OOC_High'] == True]
+
+# Select and rename columns for the final report
+report_columns = [
+    'area', 'sdwt_desc', 'prc_eqp_id', 'item_id',
+    'prc_tkin_time', 'value', 'EWMA', 'UCL', 'spec_high'
+]
+
+final_report = (
+    final_report[report_columns]
+    .rename(columns={'value': 'Last Value', 'prc_tkin_time': 'Last Run Time'})
+    .sort_values('EWMA', ascending=False)
+)
+
+# Display in Streamlit
+import streamlit as st
+st.title("🚨 Trending Up Tool Items (EWMA OOC)")
+st.dataframe(final_report)
+
+# Optionally, add an interactive chart to inspect the data for a selected item
+selected_group = st.selectbox('Select a trending group to view the chart:', final_report['prc_eqp_id'] + " - " + final_report['item_id'])
+
+if selected_group:
+    eqp, item = selected_group.split(' - ')
+    chart_data = df_results[(df_results['prc_eqp_id'] == eqp) & (df_results['item_id'] == item)]
+
+    st.line_chart(
+        chart_data[['value', 'EWMA', 'UCL', 'LCL', 'spec_high']].set_index(chart_data['prc_tkin_time'])
+    )
+
